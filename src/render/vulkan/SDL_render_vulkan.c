@@ -287,6 +287,16 @@ typedef struct
     VkBuffer vertexBuffer;
 } VULKAN_DrawStateCache;
 
+typedef struct VULKAN_TextureDeleteList {
+    VULKAN_TextureData *textureData;
+    struct VULKAN_TextureDeleteList *next;
+} VULKAN_TextureDeleteList;
+
+typedef struct VULKAN_PaletteDeleteList {
+    VULKAN_PaletteData *paletteData;
+    struct VULKAN_PaletteDeleteList *next;
+} VULKAN_PaletteDeleteList;
+
 // Private renderer data
 typedef struct
 {
@@ -388,6 +398,9 @@ typedef struct
     VkComponentMapping identitySwizzle;
     int currentVertexBuffer;
     bool issueBatch;
+
+    VULKAN_PaletteDeleteList *paletteDeleteList;
+    VULKAN_TextureDeleteList *textureDeleteList;
 } VULKAN_RenderData;
 
 static bool VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, VkImage image, VkFormat format, int plane, int x, int y, int w, int h, const void *pixels, int pitch, VkImageLayout *imageLayout);
@@ -497,8 +510,11 @@ static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 output_col
 }
 
 static void VULKAN_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture);
+static void VULKAN_DestroyTextureInternal(VULKAN_RenderData *rendererData, VULKAN_TextureData *textureData);
+static void VULKAN_DestroyPaletteInternal(VULKAN_RenderData *rendererData, VULKAN_PaletteData *paletteData);
 static void VULKAN_DestroyBuffer(VULKAN_RenderData *rendererData, VULKAN_Buffer *vulkanBuffer);
 static void VULKAN_DestroyImage(VULKAN_RenderData *rendererData, VULKAN_Image *vulkanImage);
+static void VULKAN_DestroyQueuedObjects(VULKAN_RenderData *rendererData);
 static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData);
 static void VULKAN_EnsureCommandBuffer(VULKAN_RenderData *rendererData);
 static void VULKAN_RecordPipelineImageBarrier(VULKAN_RenderData *rendererData, VkAccessFlags sourceAccessMask, VkAccessFlags destAccessMask, VkPipelineStageFlags srcStageFlags, VkPipelineStageFlags dstStageFlags, VkImageLayout destLayout, VkImage image, VkImageLayout *imageLayout);
@@ -524,6 +540,7 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     for (SDL_Texture *texture = renderer->textures; texture; texture = texture->next) {
         VULKAN_DestroyTexture(renderer, texture);
     }
+    VULKAN_DestroyQueuedObjects(rendererData);
 
     if (rendererData->waitDestStageMasks) {
         SDL_free(rendererData->waitDestStageMasks);
@@ -1143,7 +1160,30 @@ static VkResult VULKAN_IssueBatch(VULKAN_RenderData *rendererData)
 
     VULKAN_ResetCommandList(rendererData);
 
+    VULKAN_DestroyQueuedObjects(rendererData);
+
     return result;
+}
+
+static void VULKAN_DestroyQueuedObjects(VULKAN_RenderData *rendererData) {
+
+    VULKAN_PaletteDeleteList *p = rendererData->paletteDeleteList;
+    while (p) {
+        VULKAN_PaletteDeleteList *next = p->next;
+        VULKAN_DestroyPaletteInternal(rendererData, p->paletteData);
+        SDL_free(p);
+        p = next;
+    }
+    rendererData->paletteDeleteList = NULL;
+
+    VULKAN_TextureDeleteList *t = rendererData->textureDeleteList;
+    while (t) {
+        VULKAN_TextureDeleteList *next = t->next;
+        VULKAN_DestroyTextureInternal(rendererData, t->textureData);
+        SDL_free(t);
+        t = next;
+    }
+    rendererData->textureDeleteList = NULL;
 }
 
 static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
@@ -2620,13 +2660,20 @@ static void VULKAN_DestroyPalette(SDL_Renderer *renderer, SDL_TexturePalette *pa
         return;
     }
 
-    /* Because VULKAN_DestroyPalette might be called while the data is in-flight, we need to issue the batch first
-       Unfortunately, this means that deleting a lot of palettes mid-frame will have poor performance. */
-    VULKAN_IssueBatch(data);
-    VULKAN_WaitForGPU(data);
+    VULKAN_PaletteDeleteList *entry = SDL_calloc(1, sizeof(*entry));
+    entry->paletteData = palettedata;
+    entry->next = data->paletteDeleteList;
+    data->paletteDeleteList = entry;
+}
 
-    VULKAN_DestroyImage(data, &palettedata->image);
-    SDL_free(palettedata);
+static void VULKAN_DestroyPaletteInternal(VULKAN_RenderData *rendererData, VULKAN_PaletteData *paletteData) {
+    // /* Because VULKAN_DestroyPalette might be called while the data is in-flight, we need to issue the batch first
+    //    Unfortunately, this means that deleting a lot of palettes mid-frame will have poor performance. */
+    // VULKAN_IssueBatch(rendererData);
+    // VULKAN_WaitForGPU(rendererData);
+
+    VULKAN_DestroyImage(rendererData, &paletteData->image);
+    SDL_free(paletteData);
 }
 
 static bool VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL_PropertiesID create_props)
@@ -2820,10 +2867,18 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
         return;
     }
 
-    /* Because SDL_DestroyTexture might be called while the data is in-flight, we need to issue the batch first
-       Unfortunately, this means that deleting a lot of textures mid-frame will have poor performance. */
-    VULKAN_IssueBatch(rendererData);
-    VULKAN_WaitForGPU(rendererData);
+    texture->internal = NULL;
+    VULKAN_TextureDeleteList *entry = SDL_calloc(1, sizeof(*entry));
+    entry->textureData = textureData;
+    entry->next = rendererData->textureDeleteList;
+    rendererData->textureDeleteList = entry;
+}
+
+static void VULKAN_DestroyTextureInternal(VULKAN_RenderData *rendererData, VULKAN_TextureData *textureData) {
+    // /* Because SDL_DestroyTexture might be called while the data is in-flight, we need to issue the batch first
+    //    Unfortunately, this means that deleting a lot of textures mid-frame will have poor performance. */
+    // VULKAN_IssueBatch(rendererData);
+    // VULKAN_WaitForGPU(rendererData);
 
     VULKAN_DestroyImage(rendererData, &textureData->mainImage);
 
@@ -2859,7 +2914,7 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
     }
 
     SDL_free(textureData);
-    texture->internal = NULL;
+    // texture->internal = NULL;
 }
 
 static bool VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, VkImage image, VkFormat format, int plane, int x, int y, int w, int h, const void *pixels, int pitch, VkImageLayout *imageLayout)
