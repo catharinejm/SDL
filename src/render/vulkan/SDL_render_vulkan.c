@@ -543,10 +543,13 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     }
 
     // Release all textures
-    for (SDL_Texture *texture = renderer->textures; texture; texture = texture->next) {
-        VULKAN_DestroyTexture(renderer, texture);
-    }
     VULKAN_DestroyQueuedObjects(rendererData);
+    for (SDL_Texture *texture = renderer->textures; texture; texture = texture->next) {
+        VULKAN_TextureData *textureData = (VULKAN_TextureData*)texture->internal;
+        if (textureData != NULL) {
+            VULKAN_DestroyTextureInternal(rendererData, textureData);
+        }
+    }
 
     if (rendererData->waitDestStageMasks) {
         SDL_free(rendererData->waitDestStageMasks);
