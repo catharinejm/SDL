@@ -297,6 +297,11 @@ typedef struct VULKAN_PaletteDeleteList {
     struct VULKAN_PaletteDeleteList *next;
 } VULKAN_PaletteDeleteList;
 
+typedef struct VULKAN_StagingBufferDeleteList {
+    VULKAN_Buffer stagingBuffer;
+    struct VULKAN_StagingBufferDeleteList *next;
+} VULKAN_StagingBufferDeleteList;
+
 // Private renderer data
 typedef struct
 {
@@ -401,6 +406,7 @@ typedef struct
 
     VULKAN_PaletteDeleteList *paletteDeleteList;
     VULKAN_TextureDeleteList *textureDeleteList;
+    VULKAN_StagingBufferDeleteList *stagingBufferDeleteList;
 } VULKAN_RenderData;
 
 static bool VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, VkImage image, VkFormat format, int plane, int x, int y, int w, int h, const void *pixels, int pitch, VkImageLayout *imageLayout);
@@ -1184,6 +1190,15 @@ static void VULKAN_DestroyQueuedObjects(VULKAN_RenderData *rendererData) {
         t = next;
     }
     rendererData->textureDeleteList = NULL;
+
+    VULKAN_StagingBufferDeleteList *s = rendererData->stagingBufferDeleteList;
+    while (s) {
+        VULKAN_StagingBufferDeleteList *next = s->next;
+        VULKAN_DestroyBuffer(rendererData, &s->stagingBuffer);
+        SDL_free(s);
+        s = next;
+    }
+    rendererData->stagingBufferDeleteList = NULL;
 }
 
 static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
@@ -2660,6 +2675,7 @@ static void VULKAN_DestroyPalette(SDL_Renderer *renderer, SDL_TexturePalette *pa
         return;
     }
 
+    // Enqueue palette data to be deleted after next VULKAN_IssueBatch
     VULKAN_PaletteDeleteList *entry = SDL_calloc(1, sizeof(*entry));
     entry->paletteData = palettedata;
     entry->next = data->paletteDeleteList;
@@ -2667,11 +2683,6 @@ static void VULKAN_DestroyPalette(SDL_Renderer *renderer, SDL_TexturePalette *pa
 }
 
 static void VULKAN_DestroyPaletteInternal(VULKAN_RenderData *rendererData, VULKAN_PaletteData *paletteData) {
-    // /* Because VULKAN_DestroyPalette might be called while the data is in-flight, we need to issue the batch first
-    //    Unfortunately, this means that deleting a lot of palettes mid-frame will have poor performance. */
-    // VULKAN_IssueBatch(rendererData);
-    // VULKAN_WaitForGPU(rendererData);
-
     VULKAN_DestroyImage(rendererData, &paletteData->image);
     SDL_free(paletteData);
 }
@@ -2868,6 +2879,8 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
     }
 
     texture->internal = NULL;
+
+    // Enqueue texture data to be deleted after next VULKAN_IssueBatch
     VULKAN_TextureDeleteList *entry = SDL_calloc(1, sizeof(*entry));
     entry->textureData = textureData;
     entry->next = rendererData->textureDeleteList;
@@ -2875,11 +2888,6 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
 }
 
 static void VULKAN_DestroyTextureInternal(VULKAN_RenderData *rendererData, VULKAN_TextureData *textureData) {
-    // /* Because SDL_DestroyTexture might be called while the data is in-flight, we need to issue the batch first
-    //    Unfortunately, this means that deleting a lot of textures mid-frame will have poor performance. */
-    // VULKAN_IssueBatch(rendererData);
-    // VULKAN_WaitForGPU(rendererData);
-
     VULKAN_DestroyImage(rendererData, &textureData->mainImage);
 
 #ifdef SDL_HAVE_YUV
@@ -3212,10 +3220,13 @@ static void VULKAN_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
         textureData->mainImage.image,
         &textureData->mainImage.imageLayout);
 
-    // Execute the command list before releasing the staging buffer
-    VULKAN_IssueBatch(rendererData);
+    // Enqueue staging buffer for deletion after next call to VULKAN_IssueBatch
+    VULKAN_StagingBufferDeleteList *entry = SDL_calloc(1, sizeof(*entry));
+    SDL_memcpy(&entry->stagingBuffer, &textureData->stagingBuffer, sizeof(entry->stagingBuffer));
+    entry->next = rendererData->stagingBufferDeleteList;
+    rendererData->stagingBufferDeleteList = entry;
 
-    VULKAN_DestroyBuffer(rendererData, &textureData->stagingBuffer);
+    SDL_zero(textureData->stagingBuffer);
 }
 
 static bool VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
